@@ -152,7 +152,7 @@ mod tests {
         bytecode::Bytecode,
         database::CacheDB,
         database_interface::EmptyDB,
-        interpreter::{gas::params::GasParams, interpreter::ExtBytecode, InputsImpl, SharedMemory},
+        interpreter::{interpreter::ExtBytecode, InputsImpl, SharedMemory},
         primitives::{hardfork::SpecId, Bytes},
         Context, MainContext,
     };
@@ -171,7 +171,6 @@ mod tests {
             false,
             SpecId::default(),
             u64::MAX,
-            GasParams::default(),
         );
         let db = CacheDB::new(EmptyDB::default());
 
@@ -202,7 +201,6 @@ mod tests {
             false,
             SpecId::default(),
             u64::MAX,
-            GasParams::default(),
         );
         let db = CacheDB::new(EmptyDB::default());
 
