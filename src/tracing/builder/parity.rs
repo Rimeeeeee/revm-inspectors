@@ -8,7 +8,6 @@ use alloc::{collections::VecDeque, string::ToString, vec, vec::Vec};
 use alloy_primitives::{map::HashSet, Address, U256, U64};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::parity::*;
-use core::iter::Peekable;
 use revm::{
     context_interface::result::{ExecutionResult, HaltReasonTr, ResultAndState},
     primitives::{hardfork::SpecId, KECCAK_EMPTY},
@@ -162,6 +161,8 @@ impl ParityTraceBuilder {
             vec![]
         };
 
+        let frame_transaction_root =
+            self.nodes.first().is_some_and(|node| node.trace.frame_transaction_root);
         let mut trace_res = self.into_trace_results(result, trace_types);
 
         // check the state diff case
@@ -172,6 +173,9 @@ impl ParityTraceBuilder {
         // check the vm trace case
         if let Some(ref mut vm_trace) = trace_res.vm_trace {
             populate_vm_trace_bytecodes(&db, vm_trace, breadth_first_addresses)?;
+            if frame_transaction_root {
+                vm_trace.code = Default::default();
+            }
         }
 
         Ok(trace_res)
@@ -214,8 +218,11 @@ impl ParityTraceBuilder {
     fn transaction_traces(&self) -> Vec<TransactionTrace> {
         let mut traces = Vec::with_capacity(self.nodes.len());
         let mut trace_addresses = self.trace_addresses();
-        // Boolean marker to track if sorting for selfdestruct is needed
-        let mut sorting_selfdestruct = false;
+        // EIP-8141 may add skipped atomic frames after later frames have already executed, so its
+        // arena order need not be its consensus frame order. Selfdestruct traces also require a
+        // trace-address sort.
+        let mut sorting_selfdestruct =
+            self.nodes.first().is_some_and(|node| node.trace.frame_transaction_root);
 
         for node in self.iter_traceable_nodes() {
             let trace_address = core::mem::take(&mut trace_addresses[node.idx]);
@@ -251,17 +258,7 @@ impl ParityTraceBuilder {
 
     /// Returns an iterator over all recorded traces  for `trace_transaction`
     pub fn into_transaction_traces_iter(self) -> impl Iterator<Item = TransactionTrace> {
-        let trace_addresses = self.trace_addresses();
-        TransactionTraceIter {
-            next_selfdestructs: Default::default(),
-            iter: self
-                .nodes
-                .into_iter()
-                .zip(trace_addresses)
-                .filter(|(node, _)| !node.is_precompile())
-                .map(|(node, trace_address)| (node.parity_transaction_trace(trace_address), node))
-                .peekable(),
-        }
+        self.transaction_traces().into_iter()
     }
 
     /// Returns the raw traces of the transaction
@@ -285,13 +282,48 @@ impl ParityTraceBuilder {
     ///
     /// does not have the code fields filled in
     pub fn vm_trace(&self) -> VmTrace {
-        self.nodes.first().map(|node| self.make_vm_trace(node)).unwrap_or_default()
+        self.nodes
+            .first()
+            .map(|node| {
+                if node.trace.frame_transaction_root {
+                    self.make_frame_transaction_vm_trace(node)
+                } else {
+                    self.make_vm_trace(node)
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Creates the synthetic VM root specified for an EIP-8141 frame transaction.
+    fn make_frame_transaction_vm_trace(&self, root: &CallTraceNode) -> VmTrace {
+        let ops = root
+            .children
+            .iter()
+            .filter_map(|child| {
+                let trace = &self.nodes[*child].trace;
+                trace.entered_evm.then(|| VmInstruction {
+                    pc: trace.frame_index.expect("frame trace nodes carry their frame index"),
+                    cost: trace.gas_limit,
+                    ex: Some(VmExecutedOperation {
+                        used: trace.gas_limit.saturating_sub(trace.gas_used),
+                        push: Default::default(),
+                        mem: None,
+                        store: None,
+                    }),
+                    sub: Some(self.make_vm_trace(&self.nodes[*child])),
+                    op: None,
+                    idx: None,
+                })
+            })
+            .collect();
+        VmTrace { code: Default::default(), ops }
     }
 
     /// Returns a VM trace without the code filled in
     ///
     /// Iteratively creates a VM trace by traversing the recorded nodes in the arena
     fn make_vm_trace(&self, start: &CallTraceNode) -> VmTrace {
+        let start_idx = start.idx;
         let mut child_idx_stack = Vec::with_capacity(self.nodes.len());
         let mut sub_stack = VecDeque::with_capacity(self.nodes.len());
 
@@ -328,7 +360,7 @@ impl ParityTraceBuilder {
                     }
 
                     match current.parent {
-                        Some(parent) => {
+                        Some(parent) if current.idx != start_idx => {
                             sub_stack.push_back(Some(VmTrace {
                                 code: Default::default(),
                                 ops: instructions,
@@ -338,7 +370,7 @@ impl ParityTraceBuilder {
 
                             current = self.nodes.get(parent).expect("there should be a parent");
                         }
-                        None => break instructions,
+                        _ => break instructions,
                     }
                 }
             }
@@ -379,56 +411,6 @@ impl ParityTraceBuilder {
             op: Some(step.op.to_string()),
             idx: None,
         }
-    }
-}
-
-/// An iterator for [TransactionTrace]s
-struct TransactionTraceIter<Iter: Iterator> {
-    /// The iterator over all traces
-    iter: Peekable<Iter>,
-    /// The selfdestruct objects that are derived from the yielded traces.
-    ///
-    /// This is a stack because we need to yield them in the correct order.
-    next_selfdestructs: Vec<TransactionTrace>,
-}
-
-impl<Iter> Iterator for TransactionTraceIter<Iter>
-where
-    Iter: Iterator<Item = (TransactionTrace, CallTraceNode)>,
-{
-    type Item = TransactionTrace;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // ensure the selfdestruct trace is emitted just at the ending of the same depth
-        if !self.next_selfdestructs.is_empty() {
-            // find the next selfdestruct to yield
-            if let Some((next_trace, _)) = self.iter.peek() {
-                // find the most recently recorded selfdestruct that has a lower address
-                if let Some(pos) = self
-                    .next_selfdestructs
-                    .iter()
-                    .rposition(|selfdestruct| selfdestruct.trace_address < next_trace.trace_address)
-                {
-                    return Some(self.next_selfdestructs.remove(pos));
-                }
-            } else {
-                // drain the recorded selfdestructs
-                return self.next_selfdestructs.pop();
-            }
-        }
-
-        let (mut trace, node) = self.iter.next()?;
-        if node.is_selfdestruct() {
-            // since selfdestructs are emitted as additional trace, increase the trace count
-            let mut addr = trace.trace_address.clone();
-            addr.push(trace.subtraces);
-            // need to account for the additional selfdestruct trace
-            trace.subtraces += 1;
-            if let Some(selfdestruct) = node.parity_selfdestruct_trace(addr) {
-                self.next_selfdestructs.push(selfdestruct);
-            }
-        }
-        Some(trace)
     }
 }
 
