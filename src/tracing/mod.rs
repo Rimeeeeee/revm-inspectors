@@ -119,6 +119,29 @@ struct FrameTransactionTrace {
     pending_frame: Option<usize>,
 }
 
+/// An error returned while finalizing an EIP-8141 frame-transaction trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FrameTransactionTraceError {
+    /// The supplied execution result is not for a frame transaction.
+    #[error("execution result is not an EIP-8141 frame transaction")]
+    NotFrameTransaction,
+    /// The inspector did not observe any executable frame in the transaction.
+    #[error("tracing inspector did not observe the EIP-8141 frame transaction")]
+    NotObserved,
+    /// The execution result does not contain one receipt and output per frame.
+    #[error(
+        "EIP-8141 result length mismatch: {frames} frames, {receipts} receipts, {outputs} outputs"
+    )]
+    ResultLengthMismatch {
+        /// Number of frames in the transaction.
+        frames: usize,
+        /// Number of frame receipts in the execution result.
+        receipts: usize,
+        /// Number of frame outputs in the execution result.
+        outputs: usize,
+    },
+}
+
 impl TracingInspector {
     /// Returns a new instance for the given config
     pub fn new(config: TracingInspectorConfig) -> Self {
@@ -275,16 +298,19 @@ impl TracingInspector {
     /// EIP-8141 executes each top-level frame separately. The execution result is therefore the
     /// source of truth for each frame's final gas, output, and receipt status, including frames
     /// skipped after an atomic batch failure. Call this once, after `transact` returns its
-    /// [`ExecutionResult::FrameTransaction`]. Returns `true` when a frame trace was finalized.
+    /// [`ExecutionResult::FrameTransaction`].
+    ///
+    /// Frames that fail before an inspector hook runs are reconstructed from their transaction
+    /// data and receipt so that every transaction frame is represented in the trace.
     pub fn finalize_frame_transaction<HaltReasonTy>(
         &mut self,
         result: &ExecutionResult<HaltReasonTy>,
-    ) -> bool {
+    ) -> Result<(), FrameTransactionTraceError> {
         let ExecutionResult::FrameTransaction { frame_receipts, frame_outputs, .. } = result else {
-            return false;
+            return Err(FrameTransactionTraceError::NotFrameTransaction);
         };
         let Some(frame_transaction) = self.frame_transaction.as_ref() else {
-            return false;
+            return Err(FrameTransactionTraceError::NotObserved);
         };
 
         let root = frame_transaction.root;
@@ -293,18 +319,27 @@ impl TracingInspector {
         let mut frame_nodes = frame_transaction.frame_nodes.clone();
 
         if frame_receipts.len() != frames.len() || frame_outputs.len() != frames.len() {
-            return false;
+            return Err(FrameTransactionTraceError::ResultLengthMismatch {
+                frames: frames.len(),
+                receipts: frame_receipts.len(),
+                outputs: frame_outputs.len(),
+            });
         }
 
         for (index, (frame, receipt)) in frames.iter().zip(frame_receipts).enumerate() {
             let node = match frame_nodes[index] {
                 Some(node) => node,
-                None if receipt.status == FrameStatus::SkippedAtomicBatch => {
-                    let node = self.push_skipped_frame_trace(root, sender, frame, index);
+                None => {
+                    let node = self.push_unexecuted_frame_trace(
+                        root,
+                        sender,
+                        frame,
+                        index,
+                        receipt.status,
+                    );
                     frame_nodes[index] = Some(node);
                     node
                 }
-                None => return false,
             };
 
             let trace = &mut self.traces.arena[node].trace;
@@ -373,7 +408,7 @@ impl TracingInspector {
             frame_transaction.frame_nodes = frame_nodes;
             frame_transaction.pending_frame = None;
         }
-        true
+        Ok(())
     }
 
     /// Consumes the Inspector and returns a [ParityTraceBuilder].
@@ -503,7 +538,7 @@ impl TracingInspector {
             parent,
             push_kind,
             CallTrace {
-                depth: context.journal().depth() + usize::from(self.frame_transaction.is_some()),
+                depth: context.journal().depth(),
                 address,
                 kind,
                 data: input_data,
@@ -552,17 +587,25 @@ impl TracingInspector {
 
     /// Returns whether a frame hook is beginning a top-level EIP-8141 frame.
     fn is_top_level_frame<CTX: ContextTr>(&self, context: &CTX) -> bool {
-        context.local().frame_transaction().is_some() && context.journal().depth() == 0
+        // The frame orchestrator opens a rollback checkpoint before invoking the inspector. A
+        // top-level frame therefore starts at depth one; nested EVM calls start at greater depths.
+        context.local().frame_transaction().is_some() && context.journal().depth() == 1
     }
 
-    /// Adds an EIP-8141 atomic-batch frame which did not enter the EVM.
-    fn push_skipped_frame_trace(
+    /// Adds an EIP-8141 frame which did not reach an inspector call hook.
+    fn push_unexecuted_frame_trace(
         &mut self,
         root: usize,
         sender: Address,
         frame: &Frame,
         frame_index: usize,
+        status: FrameStatus,
     ) -> usize {
+        let error = match status {
+            FrameStatus::Failure => "frame failed",
+            FrameStatus::SkippedAtomicBatch => "frame skipped",
+            FrameStatus::Success => "frame trace unavailable",
+        };
         self.traces.push_trace(
             root,
             PushTraceKind::PushAndAttachToParent,
@@ -579,7 +622,7 @@ impl TracingInspector {
                 value: frame.value,
                 data: frame.data.clone(),
                 gas_limit: frame.limits.execution.saturating_add(frame.limits.state),
-                error: Some("frame skipped".into()),
+                error: Some(error.into()),
                 frame_index: Some(frame_index),
                 ..Default::default()
             },
@@ -588,19 +631,23 @@ impl TracingInspector {
 
     /// Removes logs from a trace and all of its descendants after a frame-level rollback.
     fn clear_trace_logs(&mut self, trace: usize) {
-        let children = self.traces.arena[trace].children.clone();
-        let node = &mut self.traces.arena[trace];
-        node.logs.clear();
-        node.ordering.retain(|member| !matches!(member, TraceMemberOrder::Log(_)));
-        for child in children {
-            self.clear_trace_logs(child);
+        let mut pending = vec![trace];
+        while let Some(trace) = pending.pop() {
+            let node = &mut self.traces.arena[trace];
+            pending.extend_from_slice(&node.children);
+            node.logs.clear();
+            node.ordering.retain(|member| !matches!(member, TraceMemberOrder::Log(_)));
         }
     }
 
     /// Renumbers visible logs after frame-level rollbacks have removed earlier logs.
     fn reindex_trace_logs(&mut self, trace: usize, log_index: &mut u64) {
-        let ordering = self.traces.arena[trace].ordering.clone();
-        for member in ordering {
+        let mut pending = vec![(trace, 0)];
+        while let Some((trace, position)) = pending.pop() {
+            let Some(member) = self.traces.arena[trace].ordering.get(position).copied() else {
+                continue;
+            };
+            pending.push((trace, position + 1));
             match member {
                 TraceMemberOrder::Log(index) => {
                     self.traces.arena[trace].logs[index].index = *log_index;
@@ -608,7 +655,7 @@ impl TracingInspector {
                 }
                 TraceMemberOrder::Call(index) => {
                     let child = self.traces.arena[trace].children[index];
-                    self.reindex_trace_logs(child, log_index);
+                    pending.push((child, 0));
                 }
                 TraceMemberOrder::Step(_) => {}
             }
@@ -1166,7 +1213,7 @@ mod tests {
             ],
         };
 
-        assert!(inspector.finalize_frame_transaction(&result));
+        inspector.finalize_frame_transaction(&result).unwrap();
         let root = &inspector.traces.arena[0];
         assert_eq!(root.trace.gas_used, 100);
         assert_eq!(root.children.len(), 4);

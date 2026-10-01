@@ -32,13 +32,13 @@ clippy.lint_groups_priority = "allow"
 # eth
 alloy-eip2930 = { version = "0.2.4", default-features = false }
 alloy-eip8141 = { git = "https://github.com/Soubhik-10/eips", rev = "34e7c51884d47356a619dcc4629ea77ad96a6b23", default-features = false }
-alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", branch = "feat/eip8141-transaction", version = "2.4.1", default-features = false }
-alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", branch = "feat/eip8141-transaction", version = "2.4.1", default-features = false }
+alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "f8bef1c5d7b9fabbb81de3d867ee98a4f0c7a4da", version = "2.4.1", default-features = false }
+alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "f8bef1c5d7b9fabbb81de3d867ee98a4f0c7a4da", version = "2.4.1", default-features = false }
 alloy-sol-types = { version = "1.4", default-features = false }
 alloy-primitives = { version = "1.4", default-features = false, features = [
     "map",
 ] }
-revm = { git = "https://github.com/Soubhik-10/revm", branch = "feat/eip8141-frame-transactions", version = "43.0.2", default-features = false }
+revm = { git = "https://github.com/Soubhik-10/revm", rev = "b7072ed48a2b08079838e287e39daa949513becf", version = "43.0.2", default-features = false }
 
 anstyle = { version = "1.0", optional = true }
 colorchoice = "1.0"

@@ -337,16 +337,47 @@ impl<'a> GethTraceBuilder<'a> {
     /// Atomic skips are appended to the trace arena after execution, so arena order does not
     /// necessarily match frame order. This uses the explicit child order instead.
     fn geth_frame_transaction_call_frame(&self, index: usize, include_logs: bool) -> CallFrame {
+        struct PendingFrame {
+            index: usize,
+            next_child: usize,
+            logs_visible: bool,
+            frame: CallFrame,
+        }
+
         let node = &self.nodes[index];
         let logs_visible = include_logs && !node.trace.is_error();
-        let mut call = node.geth_empty_call_frame(logs_visible);
-        for child in &node.children {
-            call.calls.push(self.geth_frame_transaction_call_frame(*child, logs_visible));
+        let mut pending = vec![PendingFrame {
+            index,
+            next_child: 0,
+            logs_visible,
+            frame: node.geth_empty_call_frame(logs_visible),
+        }];
+
+        loop {
+            let current = pending.last_mut().expect("frame assembly stack is not empty");
+            if let Some(&child) = self.nodes[current.index].children.get(current.next_child) {
+                current.next_child += 1;
+                let node = &self.nodes[child];
+                let logs_visible = current.logs_visible && !node.trace.is_error();
+                pending.push(PendingFrame {
+                    index: child,
+                    next_child: 0,
+                    logs_visible,
+                    frame: node.geth_empty_call_frame(logs_visible),
+                });
+                continue;
+            }
+
+            let mut completed = pending.pop().expect("frame assembly stack is not empty");
+            if let Some(selfdestruct) = self.nodes[completed.index].geth_selfdestruct_call_trace() {
+                completed.frame.calls.push(selfdestruct);
+            }
+            if let Some(parent) = pending.last_mut() {
+                parent.frame.calls.push(completed.frame);
+            } else {
+                return completed.frame;
+            }
         }
-        if let Some(selfdestruct) = node.geth_selfdestruct_call_trace() {
-            call.calls.push(selfdestruct);
-        }
-        call
     }
 
     ///  Returns the accounts necessary for transaction execution.

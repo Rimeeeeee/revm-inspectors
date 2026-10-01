@@ -7,6 +7,8 @@ pub mod repro;
 pub mod utils;
 
 #[cfg(feature = "std")]
+mod frame_transaction;
+#[cfg(feature = "std")]
 mod geth;
 #[cfg(feature = "js-tracer")]
 mod geth_js;
